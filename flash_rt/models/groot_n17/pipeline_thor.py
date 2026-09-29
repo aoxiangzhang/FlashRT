@@ -1162,9 +1162,10 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
 
         gemm.bf16_nn(O_ptr, int(weights["o_w"][li]),
                       o_out_ptr, Sa, D, D, int(stream))
-        fvk.add_bias_bf16(o_out_ptr, int(weights["o_b"][li]),
-                           Sa, D, int(stream))
-        fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))
+        # strict: rounds x+bias to bf16 before the residual add —
+        # bit-identical to the add_bias -> residual_add chain.
+        fvk.bias_residual_strict_bf16(
+            h_ptr, o_out_ptr, int(weights["o_b"][li]), Sa, D, int(stream))
 
         # ── Pre-FF LayerNorm (no affine — DiT default) ───────────────
         fvk.layer_norm_no_affine_bf16(
@@ -1239,14 +1240,13 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         else:
             gemm.bf16_nn(xn_ptr, int(weights["ff_proj_w"][li]),
                           ff_out_ptr, Sa, FF, D, int(stream))
-            fvk.add_bias_bf16(ff_out_ptr, int(weights["ff_proj_b"][li]),
-                               Sa, FF, int(stream))
-            fvk.gelu_inplace(ff_out_ptr, Sa * FF, int(stream))
+            # strict: bit-identical to add_bias + gelu_inplace
+            fvk.bias_gelu_bf16_strict(
+                ff_out_ptr, int(weights["ff_proj_b"][li]), Sa, FF, int(stream))
             gemm.bf16_nn(ff_out_ptr, int(weights["ff_down_w"][li]),
                           o_out_ptr, Sa, D, FF, int(stream))
             fvk.add_bias_bf16(o_out_ptr, int(weights["ff_down_b"][li]),
                                Sa, D, int(stream))
-        fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))
 
 
 def embodiment_state_encode(gemm, fvk, bufs, weights, dims, *,

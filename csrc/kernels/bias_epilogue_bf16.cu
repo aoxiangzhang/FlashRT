@@ -13,6 +13,8 @@
 // ``bias`` is broadcast over rows. General (model-agnostic).
 // ================================================================
 
+#include "bias_epilogue_bf16.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 

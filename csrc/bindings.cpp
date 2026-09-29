@@ -322,6 +322,7 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #endif
 #include "quantize/qkv_split_norm_rope_bf16.cuh"
 #include "kernels/qk_norm_rope_rotate_half_bf16.cuh"
+#include "kernels/bias_epilogue_bf16.cuh"
 #include "attention/fmha_dispatch.h"
 #ifdef ENABLE_MOTUS_SAGE2_RAW
 #include "attention/sage2/sage2_attn_raw.cuh"
@@ -1766,6 +1767,15 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("residual"), py::arg("x"), py::arg("bias"),
        py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
 
+    m.def("bias_residual_strict_bf16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t bias,
+             int seq_len, int dim, uintptr_t stream) {
+        bias_residual_strict_bf16(typed_ptr<__nv_bfloat16>(residual),
+                                  typed_ptr<__nv_bfloat16>(x),
+                                  typed_ptr<__nv_bfloat16>(bias),
+                                  seq_len, dim, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("bias"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
     m.def("bias_residual_strict_fp16",
           [](uintptr_t residual, uintptr_t x, uintptr_t bias,
              int seq_len, int dim, uintptr_t stream) {
@@ -1865,6 +1875,34 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("w"), py::arg("cos_table"), py::arg("sin_table"),
        py::arg("S"), py::arg("NH"), py::arg("HD"), py::arg("eps") = 1e-6f,
        py::arg("stream") = 0);
+
+    // Fused bias epilogues (bias_epilogue_bf16.cu): fold the per-column
+    // bias add into the op consuming the GEMM output. Model-agnostic.
+    m.def("qkv_split_bias_bf16",
+          [](uintptr_t qkv, uintptr_t bias, uintptr_t q, uintptr_t k,
+             uintptr_t v, int rows, int hq, int hk, int hv,
+             uintptr_t stream) {
+        auto* p_qkv = static_cast<const __nv_bfloat16*>(to_ptr(qkv));
+        auto* p_bias = static_cast<const __nv_bfloat16*>(to_ptr(bias));
+        flash_rt::kernels::qkv_split_bias_bf16(
+            p_qkv, p_bias,
+            static_cast<__nv_bfloat16*>(to_ptr(q)),
+            static_cast<__nv_bfloat16*>(to_ptr(k)),
+            static_cast<__nv_bfloat16*>(to_ptr(v)),
+            rows, hq, hk, hv, to_stream(stream));
+    }, py::arg("qkv"), py::arg("bias"), py::arg("q"), py::arg("k"),
+       py::arg("v"), py::arg("rows"), py::arg("hq"), py::arg("hk"),
+       py::arg("hv"), py::arg("stream") = 0);
+    m.def("residual_add_bias_bf16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t bias,
+             int rows, int dim, uintptr_t stream) {
+        flash_rt::kernels::residual_add_bias_bf16(
+            static_cast<__nv_bfloat16*>(to_ptr(residual)),
+            static_cast<const __nv_bfloat16*>(to_ptr(x)),
+            static_cast<const __nv_bfloat16*>(to_ptr(bias)),
+            rows, dim, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("bias"),
+       py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
 
     m.def("gate_mul_residual_fp16",
           [](uintptr_t residual, uintptr_t x, uintptr_t gate,

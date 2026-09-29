@@ -225,6 +225,7 @@ def _llm_fixture(S=1024):
         return int(w.data_ptr()), int(ws.data_ptr())
 
     def mk_weights():
+        torch.manual_seed(201)  # same values on every call (A/B legs)
         w = mk_wlists()
         # pointer-ify the plain-tensor lists (pipeline does int(w[li]))
         w["in_ln_w"] = [t.data_ptr() for t in w["in_ln_w"]]
@@ -245,6 +246,7 @@ def _llm_fixture(S=1024):
     _keep = []  # keep tensors alive behind the raw pointers
 
     def mk_bufs():
+        torch.manual_seed(202)
         b = {"h": rnd(S, D), "xn": rnd(S, D),
              "xn_fp8": rnd(S, D).view(torch.uint8).view(fp8),
              "Q": rnd(S, NHQ * HD), "K": rnd(S, NHKV * HD),
@@ -340,10 +342,189 @@ def test_qwen3vl_llm_forward_fused_matches_legacy():
     print(f"[llm A/B] S={S} cos={cos:.7f} max_abs={max_abs:.3e}")
 
 
+_BF16 = torch.bfloat16
+
+
+def test_qkv_split_bias_bf16_matches_legacy_chain():
+    # GROOT DiT self-attn: Sa tokens, D=1536, NH=32 heads x HD=48; the
+    # kernel is generic — sweep asymmetric head splits too.
+    for (S, Hq, Hk, Hv, HD) in [(41, 1536, 1536, 1536, 1),
+                                (41, 32 * 48, 32 * 48, 32 * 48, 1),
+                                (1024, 2048, 1024, 1024, 1)]:
+        W = Hq + Hk + Hv
+        packed = torch.randn(S, W, device=_DEV, dtype=_BF16)
+        bias = torch.randn(W, device=_DEV, dtype=_BF16)
+        q = torch.empty(S, Hq, device=_DEV, dtype=_BF16)
+        k = torch.empty(S, Hk, device=_DEV, dtype=_BF16)
+        v = torch.empty(S, Hv, device=_DEV, dtype=_BF16)
+        # legacy chain: add_bias in place on packed, then three strided
+        # copies
+        ref = packed.clone()
+        fvk.add_bias_bf16(_p(ref), _p(bias), S, W)
+        q_ref = ref[:, :Hq].contiguous()
+        k_ref = ref[:, Hq:Hq + Hk].contiguous()
+        v_ref = ref[:, Hq + Hk:].contiguous()
+        # fused
+        fvk.qkv_split_bias_bf16(_p(packed), _p(bias), _p(q), _p(k), _p(v),
+                                S, Hq, Hk, Hv)
+        assert torch.equal(q, q_ref) and torch.equal(k, k_ref) \
+            and torch.equal(v, v_ref), (S, Hq, Hk, Hv)
+
+
+def test_residual_add_bias_bf16_matches_legacy_chain():
+    for (M, N) in [(41, 1536), (1024, 2048)]:
+        res = torch.randn(M, N, device=_DEV, dtype=_BF16)
+        x = torch.randn(M, N, device=_DEV, dtype=_BF16)
+        bias = torch.randn(N, device=_DEV, dtype=_BF16)
+        res_ref, x_ref = res.clone(), x.clone()
+        # legacy: add bias to x then residual add
+        fvk.add_bias_bf16(_p(x_ref), _p(bias), M, N)
+        fvk.residual_add(_p(res_ref), _p(x_ref), M * N)
+        res_new = res.clone()
+        fvk.residual_add_bias_bf16(_p(res_new), _p(x), _p(bias), M, N)
+        # legacy rounds x+bias to bf16 before the residual add; the fused
+        # kernel keeps the sum in fp32. Gate at 2 bf16 ulp of the
+        # INPUT magnitudes (cancellation can zero the output, making
+        # output-relative ulp meaningless; measured max 1 ulp).
+        dev = (res_ref.float() - res_new.float()).abs()
+        # double rounding (fp16 sum -> bf16, then +res -> bf16) can shift
+        # the result by 1 ulp at the OUTPUT magnitude even when inputs
+        # are smaller — bound on the largest of the three
+        mag = torch.max(torch.maximum((x.float() + bias.float()).abs(),
+                                     res.float().abs()),
+                        res_ref.float().abs())
+        ulp = mag * 2.0 ** -7 + 2.0 ** -126  # bf16: 7 mantissa bits
+        assert (dev <= 1.001 * ulp).all(), (M, N, dev.max().item())
+
+
+def test_dit_kernel_fusions_match_legacy_chains():
+    """DiT bf16 fallback sites: strict twins must be bit-identical."""
+    for (M, N) in [(41, 1536), (257, 6144), (1024, 2048)]:
+        res = torch.randn(M, N, device=_DEV, dtype=_BF16)
+        x = torch.randn(M, N, device=_DEV, dtype=_BF16)
+        bias = torch.randn(N, device=_DEV, dtype=_BF16)
+        res_ref, x_ref = res.clone(), x.clone()
+        fvk.add_bias_bf16(_p(x_ref), _p(bias), M, N)
+        fvk.residual_add(_p(res_ref), _p(x_ref), M * N)
+        res_strict, x_strict = res.clone(), x.clone()
+        fvk.bias_residual_strict_bf16(_p(res_strict), _p(x_strict), _p(bias),
+                                      M, N)
+        assert torch.equal(res_ref, res_strict), ("bias_res", M, N)
+
+        xg = torch.randn(M, N, device=_DEV, dtype=_BF16)
+        bg = torch.randn(N, device=_DEV, dtype=_BF16)
+        xg_ref = xg.clone()
+        fvk.add_bias_bf16(_p(xg_ref), _p(bg), M, N)
+        fvk.gelu_inplace(_p(xg_ref), M * N)
+        xg_strict = xg.clone()
+        fvk.bias_gelu_bf16_strict(_p(xg_strict), _p(bg), M, N)
+        assert torch.equal(xg_ref, xg_strict), ("bias_gelu", M, N)
+
+
+def _dit_fixture(Sa=41):
+    """Weights/bufs/dims per dit_forward's bf16 fallback branch (the one
+    the RTX sm89 frontend takes — no fp8/fp4 weight keys)."""
+    from flash_rt.models.groot_n17 import pipeline_thor as P
+    D, FF, L = 1536, 6144, 32
+    torch.manual_seed(11)
+    keep = []
+
+    def rnd(*shape):
+        return torch.randn(*shape, device=_DEV, dtype=_BF16)
+
+    def mk_weights():
+        torch.manual_seed(101)  # same values on every call (A/B legs)
+        w = {"scale_msa": [rnd(D) for _ in range(L)],
+             "shift_msa": [rnd(D) for _ in range(L)],
+             "q_w": [rnd(D, D) for _ in range(L)],
+             "q_b": [rnd(D) for _ in range(L)],
+             "k_w": [rnd(D, D) for _ in range(L)],
+             "k_b": [rnd(D) for _ in range(L)],
+             "v_w": [rnd(D, D) for _ in range(L)],
+             "v_b": [rnd(D) for _ in range(L)],
+             "o_w": [rnd(D, D) for _ in range(L)],
+             "o_b": [rnd(D) for _ in range(L)],
+             "ff_proj_w": [rnd(FF, D) for _ in range(L)],
+             "ff_proj_b": [rnd(FF) for _ in range(L)],
+             "ff_down_w": [rnd(D, FF) for _ in range(L)],
+             "ff_down_b": [rnd(D) for _ in range(L)]}
+        keep.append(w)
+        return {k: ([t.data_ptr() for t in v] if isinstance(v, list) else v)
+                for k, v in w.items()}
+
+    def mk_bufs():
+        torch.manual_seed(102)
+        b = {"h": rnd(Sa, D), "xn": rnd(Sa, D), "o_proj_out": rnd(Sa, D),
+             "ff_proj_out": rnd(Sa, FF)}
+        keep.append(b)
+        return {k: t.data_ptr() for k, t in b.items()}
+
+    dims = {"Sa": Sa, "D": D, "FF": FF, "Skv_text": 64, "Skv_image": 64}
+    gemm = fvk.GemmRunner()
+    return P, gemm, dims, mk_weights, mk_bufs, keep, (Sa, D)
+
+
+class _StubDiTAttn:
+    """Deterministic DiT attention backend stand-in (32 self + 16 cross
+    sites; O filled deterministically)."""
+
+    def __init__(self, Sa, D, n_self=16, n_cross=16):
+        self.O = torch.zeros(Sa, D, device=_DEV, dtype=_BF16)
+        self._state = torch.randn(Sa, D, device=_DEV, dtype=_BF16)
+
+    def get_slot_ptrs(self, site, j):
+        return {"Q": self.O.data_ptr(), "K": self.O.data_ptr(),
+                "V": self.O.data_ptr(), "O": self.O.data_ptr()}
+
+    def run(self, site, j, *, q_seq, kv_seq=None, stream=0):
+        self.O.copy_(self._state)
+        return self.O.data_ptr()
+
+
+def test_dit_forward_fused_matches_legacy():
+    """Full 32-layer DiT A/B on the bf16 fallback branch: fused pipeline
+    vs legacy-chain shim. All wired sites are strict (bit-identical), so
+    the two legs must be torch.equal end to end."""
+    P, gemm, dims, mk_weights, mk_bufs, keep, (Sa, D) = _dit_fixture()
+
+    attn = _StubDiTAttn(Sa, D)
+    w1, b1 = mk_weights(), mk_bufs()
+    h_seed = keep[-1]["h"].clone()
+    P.dit_forward(gemm, fvk, b1, w1, dims, attn=attn, stream=0)
+    h_a = keep[-1]["h"].clone()
+
+    shim = _legacy_fvk_shim()
+
+    def legacy_bias_res(res, x, bias, M, N, stream=0):
+        fvk.add_bias_bf16(x, bias, M, N)
+        fvk.residual_add(res, x, M * N)
+
+    def legacy_bias_gelu(x, bias, M, N, stream=0):
+        fvk.add_bias_bf16(x, bias, M, N)
+        fvk.gelu_inplace(x, M * N)
+    shim.bias_residual_strict_bf16 = legacy_bias_res
+    shim.bias_gelu_bf16_strict = legacy_bias_gelu
+
+    attn2 = _StubDiTAttn(Sa, D)
+    attn2._state = attn._state.clone()
+    w2, b2 = mk_weights(), mk_bufs()
+    keep[-1]["h"].copy_(h_seed)
+    P.dit_forward(gemm, shim, b2, w2, dims, attn=attn2, stream=0)
+    h_b = keep[-1]["h"].clone()
+
+    assert torch.equal(h_a, h_b), \
+        ((h_a.float() - h_b.float()).abs().max().item())
+    print(f"[dit A/B] Sa={Sa}: bit-equal across 32 layers")
+
+
 if __name__ == "__main__":
     test_qk_norm_rope_fused_matches_legacy_chain()
     test_qk_norm_rope_fused_rejects_bad_hd()
     test_bias_gelu_inplace_strict_fp16_matches_legacy_chain()
     test_bias_residual_strict_fp16_matches_legacy_chain()
     test_qwen3vl_llm_forward_fused_matches_legacy()
+    test_qkv_split_bias_bf16_matches_legacy_chain()
+    test_residual_add_bias_bf16_matches_legacy_chain()
+    test_dit_kernel_fusions_match_legacy_chains()
+    test_dit_forward_fused_matches_legacy()
     print("ALL PASS")

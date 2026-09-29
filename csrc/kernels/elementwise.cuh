@@ -295,6 +295,9 @@ void bias_residual_fp16(__half* residual, const __half* x,
                         const __half* bias, int seq_len, int dim,
                         cudaStream_t stream = 0);
 
+void bias_residual_strict_bf16(__nv_bfloat16* residual, const __nv_bfloat16* x,
+                               const __nv_bfloat16* bias, int seq_len, int dim,
+                               cudaStream_t stream);
 void bias_residual_strict_fp16(__half* residual, const __half* x,
                                const __half* bias, int seq_len, int dim,
                                cudaStream_t stream = 0);
