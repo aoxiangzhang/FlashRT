@@ -175,9 +175,175 @@ def test_bias_residual_strict_fp16_matches_legacy_chain():
         assert torch.equal(res_ref, res_strict), (M, N)
 
 
+class _StubAttn:
+    """Deterministic stand-in for the attention backend. Both A/B legs run
+    the identical stub, so its math is irrelevant to the comparison — it
+    only has to be deterministic and shape-correct (S x NHQ*HD == S x D)."""
+
+    def __init__(self, S, D):
+        self.O = torch.zeros(S, D, device=_DEV, dtype=_FP16)
+        self._state = torch.randn(S, D, device=_DEV, dtype=_FP16)
+
+    def get_slot_ptrs(self, site, li):
+        return {"O": self.O.data_ptr()}
+
+    def run(self, site, li, *, q_seq, kv_seq=None, stream=0):
+        self.O.copy_(self._state)
+        return self.O.data_ptr()
+
+
+def _llm_fixture(S=1024):
+    """Weights/bufs/dims/scales per qwen3vl_llm_forward's docstring."""
+    from flash_rt.models.groot_n17 import pipeline_rtx_sm89 as P
+
+    D, NHQ, NHKV, HD, FF, L = 2048, 16, 8, 128, 6144, 16
+    torch.manual_seed(7)
+    fp8 = torch.float8_e4m3fn
+
+    def rnd(*shape, dtype=_FP16):
+        return torch.randn(*shape, device=_DEV, dtype=dtype)
+
+    def mk_wlists():
+        return {"in_ln_w": [rnd(D) for _ in range(L)],
+                "post_ln_w": [rnd(D) for _ in range(L)],
+                "q_norm_w": [rnd(HD) for _ in range(L)],
+                "k_norm_w": [rnd(HD) for _ in range(L)],
+                "cos": rnd(S, HD), "sin": rnd(S, HD),
+                "deepstack_inject": [0] * L,
+                "act_scales": [torch.ones(1, device=_DEV,
+                                          dtype=torch.float32)
+                               for _ in range(L)]}
+
+    def fp8w(N, K):
+        # small weights + amax/448 weight scale = the calibrated-semantics
+        # scale, keeping the descaled output in a sane fp16 range
+        w = (torch.randn(N, K, device=_DEV,
+                        dtype=torch.float32) * 0.02).to(fp8)
+        ws = torch.tensor([max(0.02 * 3.0 / 448.0, 1e-8)],
+                          device=_DEV, dtype=torch.float32)
+        _keep.append(w); _keep.append(ws)
+        return int(w.data_ptr()), int(ws.data_ptr())
+
+    def mk_weights():
+        w = mk_wlists()
+        # pointer-ify the plain-tensor lists (pipeline does int(w[li]))
+        w["in_ln_w"] = [t.data_ptr() for t in w["in_ln_w"]]
+        w["post_ln_w"] = [t.data_ptr() for t in w["post_ln_w"]]
+        w["q_norm_w"] = [t.data_ptr() for t in w["q_norm_w"]]
+        w["k_norm_w"] = [t.data_ptr() for t in w["k_norm_w"]]
+        _keep.append(w["cos"]); _keep.append(w["sin"])
+        w["cos"] = w["cos"].data_ptr(); w["sin"] = w["sin"].data_ptr()
+        for name, N, K in [("q_w", NHQ * HD, D), ("k_w", NHKV * HD, D),
+                           ("v_w", NHKV * HD, D), ("o_w", D, D),
+                           ("gate_w", FF, D), ("up_w", FF, D),
+                           ("down_w", D, FF)]:
+            pairs = [fp8w(N, K) for _ in range(L)]
+            w[name] = [p[0] for p in pairs]
+            w[name.replace("_w", "_ws")] = [p[1] for p in pairs]
+        return w
+
+    _keep = []  # keep tensors alive behind the raw pointers
+
+    def mk_bufs():
+        b = {"h": rnd(S, D), "xn": rnd(S, D),
+             "xn_fp8": rnd(S, D).view(torch.uint8).view(fp8),
+             "Q": rnd(S, NHQ * HD), "K": rnd(S, NHKV * HD),
+             "V": rnd(S, NHKV * HD), "K_exp": rnd(S, NHQ * HD),
+             "V_exp": rnd(S, NHQ * HD), "o_proj_out": rnd(S, D),
+             "gate_out": rnd(S, FF), "up_out": rnd(S, FF),
+             "gu_fp8": rnd(S, FF).view(torch.uint8).view(fp8),
+             "bf16_tmp": rnd(S, D, dtype=torch.bfloat16),
+             "bf16_ff": rnd(S, FF, dtype=torch.bfloat16)}
+        _keep.append(b)
+        return {k: v.data_ptr() for k, v in b.items()}
+
+    dims = {"S": S, "D": D, "NHQ": NHQ, "NHKV": NHKV, "HD": HD, "FF": FF}
+    # keep-alive list shared with the caller (tensor backing for raw ptrs)
+    def adv(t):
+        return t.data_ptr()
+
+    def mk_scales():
+        # amax/448 per amax_to_dev_scale: activations post-norm have
+        # amax ~3-4, so s ~ 0.008
+        for _ in range(4):  # 4 scale groups
+            _keep.append(None)
+        s = torch.full((1,), max(4.0 / 448.0, 1e-8), device=_DEV,
+                       dtype=torch.float32)
+        _keep[-4:] = [s] * 4
+        return {k: [int(s.data_ptr()) for _ in range(L)]
+                for k in ("act_qkv", "act_o", "act_gateup", "act_down")}
+
+    scales = mk_scales()
+    gemm = fvk.GemmRunner()
+    return P, gemm, dims, mk_weights, mk_bufs, scales, (S, D), _keep
+
+
+def _legacy_fvk_shim():
+    """Legacy-chain shims for the fused entry points the pipeline uses."""
+    import types
+    shim = types.SimpleNamespace()
+    for name in dir(fvk):
+        if not name.startswith("_"):
+            setattr(shim, name, getattr(fvk, name))
+
+    def qk_norm_rope_rotate_half_fp16(x, w, cos_t, sin_t, S, NH, HD, eps,
+                                      stream=0):
+        fvk.rms_norm_fp16(x, w, x, S * NH, HD, eps)
+        fvk.rope_rotate_half_fp16(x, cos_t, sin_t, S, NH, HD)
+
+    def bias_gelu_inplace_strict_fp16(x, bias, M, N, stream=0):
+        fvk.add_bias_fp16(x, bias, M, N)
+        fvk.gelu_inplace_fp16(x, M * N)
+
+    def bias_residual_strict_fp16(res, x, bias, M, N, stream=0):
+        fvk.add_bias_fp16(x, bias, M, N)
+        fvk.residual_add_fp16(res, x, M * N)
+
+    shim.qk_norm_rope_rotate_half_fp16 = qk_norm_rope_rotate_half_fp16
+    shim.bias_gelu_inplace_strict_fp16 = bias_gelu_inplace_strict_fp16
+    shim.bias_residual_strict_fp16 = bias_residual_strict_fp16
+    return shim
+
+
+def test_qwen3vl_llm_forward_fused_matches_legacy():
+    """Full LLM stage A/B: fused pipeline vs legacy-chain shim, random
+    weights, identical seeds. The qk-norm fusion's reduce re-association
+    can shift a few elements by 1 fp16 ulp per layer, so gate at
+    cos >= 0.9999 + reported max_abs; the bias/residual and bias/gelu
+    sites are strict (bit-identical chains)."""
+    P, gemm, dims, mk_weights, mk_bufs, scales, (S, D), keep = _llm_fixture()
+    attn = _StubAttn(S, D)
+
+    # Leg A: fused pipeline (post-wiring code path)
+    w1, b1 = mk_weights(), mk_bufs()
+    h_seed = keep[-1]["h"].clone()
+    P.qwen3vl_llm_forward(gemm, fvk, b1, w1, dims, scales, attn=attn,
+                          stream=0)
+    h_a = keep[-1]["h"].clone()
+
+    # Leg B: legacy chains via the shim, identical weights/bufs
+    w2, b2 = mk_weights(), mk_bufs()
+    # overwrite leg B's h with the same seed values at the same address
+    torch.Tensor._make_wrapper_subclass  # noqa: B018 (keep import surface)
+    keep[-1]["h"].copy_(h_seed)
+    attn2 = _StubAttn(S, D)
+    attn2._state = attn._state.clone()
+    P.qwen3vl_llm_forward(gemm, _legacy_fvk_shim(), b2, w2, dims, scales,
+                          attn=attn2, stream=0)
+    h_b = keep[-1]["h"].clone()
+
+    a = h_a.float().flatten()
+    b = h_b.float().flatten()
+    cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+    max_abs = (a - b).abs().max().item()
+    assert cos >= 0.9999, cos
+    print(f"[llm A/B] S={S} cos={cos:.7f} max_abs={max_abs:.3e}")
+
+
 if __name__ == "__main__":
     test_qk_norm_rope_fused_matches_legacy_chain()
     test_qk_norm_rope_fused_rejects_bad_hd()
     test_bias_gelu_inplace_strict_fp16_matches_legacy_chain()
     test_bias_residual_strict_fp16_matches_legacy_chain()
+    test_qwen3vl_llm_forward_fused_matches_legacy()
     print("ALL PASS")

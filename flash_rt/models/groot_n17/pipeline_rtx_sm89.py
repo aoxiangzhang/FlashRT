@@ -170,8 +170,10 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             act_scale_ptr=a_o, weight_scale_ptr=int(weights["o_ws"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
-        fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
+        # strict: rounds x+bias to fp16 before the residual add —
+        # bit-identical to the add_bias -> residual_add chain.
+        fvk.bias_residual_strict_fp16(
+            h_ptr, o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
 
         # ── Pre-FF LayerNorm ──
         fvk.layer_norm_fp16(
@@ -187,8 +189,10 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             act_scale_ptr=a_fc1, weight_scale_ptr=int(weights["fc1_ws"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), S, FF, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out_ptr, S * FF, int(stream))
+        # strict variant rounds x+bias to fp16 before the tanh-GELU —
+        # bit-identical to the add_bias -> gelu_inplace chain.
+        fvk.bias_gelu_inplace_strict_fp16(
+            fc1_out_ptr, int(weights["fc1_b"][li]), S, FF, int(stream))
         fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, S * FF, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
@@ -197,8 +201,8 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             act_scale_ptr=a_fc2, weight_scale_ptr=int(weights["fc2_ws"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), S, D, int(stream))
-        fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
+        fvk.bias_residual_strict_fp16(
+            h_ptr, o_proj_out, int(weights["fc2_b"][li]), S, D, int(stream))
 
         # ── DeepStack tap callback ──
         if deepstack_capture is not None and li in deepstack_taps:
@@ -250,8 +254,8 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
             act_scale_ptr=a_fc1, weight_scale_ptr=int(weights["fc1_ws"][j]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(fc1_out, int(weights["fc1_b"][j]), Nout, Dmid, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out, Nout * Dmid, int(stream))
+        fvk.bias_gelu_inplace_strict_fp16(
+            fc1_out, int(weights["fc1_b"][j]), Nout, Dmid, int(stream))
 
         fvk.quantize_fp8_static_fp16(fc1_out, fp8_scratch, a_fc2, Nout * Dmid, int(stream))
         _fp8_matmul_fp16(
@@ -354,15 +358,17 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             stream=int(stream),
         )
 
-        # ── Per-head q_norm / k_norm (BEFORE M-RoPE) ──
-        fvk.rms_norm_fp16(Q_ptr, int(weights["q_norm_w"][li]), Q_ptr,
-                          S * NHQ, HD, 1e-6, int(stream))
-        fvk.rms_norm_fp16(K_ptr, int(weights["k_norm_w"][li]), K_ptr,
-                          S * NHKV, HD, 1e-6, int(stream))
-
-        # ── M-RoPE on Q and K ──
-        fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NHQ,  HD, int(stream))
-        fvk.rope_rotate_half_fp16(K_ptr, cos_ptr, sin_ptr, S, NHKV, HD, int(stream))
+        # ── Per-head q_norm / k_norm + M-RoPE (fused, in-place) ──
+        # qk_norm_rope_rotate_half_fp16 = RMSNorm + rotate-half RoPE in one
+        # launch per tensor (GQA via separate Q/K calls). Divergence from
+        # the old 4-launch chain is bounded at 1 fp16 ulp per element
+        # (warp-butterfly vs block-tree reduce; differential-tested).
+        fvk.qk_norm_rope_rotate_half_fp16(
+            Q_ptr, int(weights["q_norm_w"][li]), cos_ptr, sin_ptr,
+            S, NHQ, HD, 1e-6, int(stream))
+        fvk.qk_norm_rope_rotate_half_fp16(
+            K_ptr, int(weights["k_norm_w"][li]), cos_ptr, sin_ptr,
+            S, NHKV, HD, 1e-6, int(stream))
 
         # ── GQA expand: K, V from NHKV → NHQ heads ──
         fvk.gpu_repeat_interleave_heads(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
@@ -512,8 +518,8 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             act_scale_ptr=a_o, weight_scale_ptr=int(weights["o_ws"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), T, D, int(stream))
-        fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
+        fvk.bias_residual_strict_fp16(
+            h_ptr, o_proj_out, int(weights["o_b"][li]), T, D, int(stream))
 
         # ── Pre-FF LayerNorm + FF (GELU) ──
         fvk.layer_norm_fp16(
@@ -527,8 +533,8 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             act_scale_ptr=a_fc1, weight_scale_ptr=int(weights["fc1_ws"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), T, FF, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out_ptr, T * FF, int(stream))
+        fvk.bias_gelu_inplace_strict_fp16(
+            fc1_out_ptr, int(weights["fc1_b"][li]), T, FF, int(stream))
         fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, T * FF, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
@@ -537,5 +543,5 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             act_scale_ptr=a_fc2, weight_scale_ptr=int(weights["fc2_ws"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), T, D, int(stream))
-        fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
+        fvk.bias_residual_strict_fp16(
+            h_ptr, o_proj_out, int(weights["fc2_b"][li]), T, D, int(stream))
