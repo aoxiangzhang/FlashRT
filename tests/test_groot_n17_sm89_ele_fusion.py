@@ -135,7 +135,49 @@ def test_qk_norm_rope_fused_rejects_bad_hd():
     assert rc == -1, "HD=100 must be rejected by the HD==128 guard"
 
 
+def test_bias_gelu_inplace_strict_fp16_matches_legacy_chain():
+    for (M, N) in [(1024, 4304), (257, 6144), (41, 1536), (1, 128)]:
+        x = torch.randn(M, N, device=_DEV, dtype=_FP16)
+        bias = torch.randn(N, device=_DEV, dtype=_FP16)
+        x_ref = x.clone()
+        # legacy chain (bit-parity target)
+        fvk.add_bias_fp16(_p(x_ref), _p(bias), M, N)
+        fvk.gelu_inplace_fp16(_p(x_ref), M * N)
+        # strict fused
+        x_strict = x.clone()
+        fvk.bias_gelu_inplace_strict_fp16(_p(x_strict), _p(bias), M, N)
+        assert torch.equal(x_ref, x_strict), (M, N)
+
+        # non-strict fused keeps x+bias in fp32 through the GELU; the
+        # legacy chain rounds it to fp16 first. Bounded by ~2 fp16 ulp of
+        # the INPUT magnitude through the gelu'<=1.13 slope (measured
+        # max 1.77). The strict variant above is the bit-parity one.
+        x_fast = x.clone()
+        fvk.bias_gelu_inplace_fp16(_p(x_fast), _p(bias), M, N)
+        dev = (x_ref.float() - x_fast.float()).abs()
+        ulp_in = ((x.float() + bias.float()).abs() * 2.0 ** -11
+                  + 2.0 ** -24)
+        assert (dev <= 2.0 * ulp_in).all(), (M, N, dev.max().item())
+
+
+def test_bias_residual_strict_fp16_matches_legacy_chain():
+    for (M, N) in [(1024, 2048), (257, 1152), (41, 1536)]:
+        res = torch.randn(M, N, device=_DEV, dtype=_FP16)
+        x = torch.randn(M, N, device=_DEV, dtype=_FP16)
+        bias = torch.randn(N, device=_DEV, dtype=_FP16)
+        res_ref, x_ref = res.clone(), x.clone()
+        # legacy chain (bit-parity target)
+        fvk.add_bias_fp16(_p(x_ref), _p(bias), M, N)
+        fvk.residual_add_fp16(_p(res_ref), _p(x_ref), M * N)
+        # strict fused
+        res_strict, x_strict = res.clone(), x.clone()
+        fvk.bias_residual_strict_fp16(_p(res_strict), _p(x_strict), _p(bias), M, N)
+        assert torch.equal(res_ref, res_strict), (M, N)
+
+
 if __name__ == "__main__":
     test_qk_norm_rope_fused_matches_legacy_chain()
     test_qk_norm_rope_fused_rejects_bad_hd()
+    test_bias_gelu_inplace_strict_fp16_matches_legacy_chain()
+    test_bias_residual_strict_fp16_matches_legacy_chain()
     print("ALL PASS")

@@ -28,6 +28,10 @@ void bias_gelu_inplace_bf16(__nv_bfloat16* x, const __nv_bfloat16* bias,
 
 // Strict variant matching add_bias_bf16 + gelu_inplace numerics: the
 // bias-add result is rounded back to BF16 before applying GELU.
+void bias_gelu_inplace_fp16(__half* x, const __half* bias,
+                              int M, int N, cudaStream_t stream);
+void bias_gelu_inplace_strict_fp16(__half* x, const __half* bias,
+                                     int M, int N, cudaStream_t stream);
 void bias_gelu_inplace_bf16_strict(__nv_bfloat16* x,
                                    const __nv_bfloat16* bias,
                                    int M, int N, cudaStream_t stream = 0);

@@ -138,6 +138,20 @@ void bias_gelu_inplace_bf16_strict(__nv_bfloat16* x,
         x, bias, M, N);
 }
 
+void bias_gelu_inplace_fp16(__half* x, const __half* bias,
+                              int M, int N, cudaStream_t stream) {
+    int total2 = (M * N) >> 1;
+    bias_gelu_kernel<__half><<<(total2 + 255) / 256, 256, 0, stream>>>(
+        x, bias, M, N);
+}
+
+void bias_gelu_inplace_strict_fp16(__half* x, const __half* bias,
+                                     int M, int N, cudaStream_t stream) {
+    int total2 = (M * N) >> 1;
+    bias_gelu_strict_kernel<__half><<<(total2 + 255) / 256, 256, 0, stream>>>(
+        x, bias, M, N);
+}
+
 // ── Gate GELU Mul Merged ──
 // Input: (seq, 2*half_dim), gate = [:, :half_dim], up = [:, half_dim:]
 template<typename T>

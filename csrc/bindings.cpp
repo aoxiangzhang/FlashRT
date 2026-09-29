@@ -1037,6 +1037,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                 M, N, to_stream(stream));
     }, py::arg("x"), py::arg("bias"),
        py::arg("M"), py::arg("N"), py::arg("stream") = 0);
+    m.def("bias_gelu_inplace_fp16", [](uintptr_t x, uintptr_t bias,
+                                         int M, int N, uintptr_t stream) {
+        bias_gelu_inplace_fp16(typed_ptr<__half>(x),
+                                typed_ptr<__half>(bias),
+                                M, N, to_stream(stream));
+    }, py::arg("x"), py::arg("bias"),
+       py::arg("M"), py::arg("N"), py::arg("stream") = 0);
+    m.def("bias_gelu_inplace_strict_fp16", [](uintptr_t x, uintptr_t bias,
+                                                int M, int N, uintptr_t stream) {
+        bias_gelu_inplace_strict_fp16(typed_ptr<__half>(x),
+                                        typed_ptr<__half>(bias),
+                                        M, N, to_stream(stream));
+    }, py::arg("x"), py::arg("bias"),
+       py::arg("M"), py::arg("N"), py::arg("stream") = 0);
 
     m.def("gate_geglu_merged", [](uintptr_t merged, uintptr_t out,
                                    int seq, int half_dim, uintptr_t stream) {
