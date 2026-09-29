@@ -123,6 +123,11 @@ Other GEMMs:
 > - `gate_geglu_*` kernels = **GELU (tanh-approx)** — Paligemma / Gemma / Pi0 / Pi0.5 FFN.
 > - `silu_mul_split_*` kernels = **true SiLU (swish)** — GROOT Qwen3 / BAGEL FFN.
 > - `fused_add_silu_*` / `silu_inplace_*` = **true SiLU**.
+- `bias_gelu_inplace_bf16/fp16[_strict]` = bias + tanh-GELU in one launch;
+  the `strict` variants round x+bias to the storage dtype first and are
+  bit-identical to the add_bias + gelu_inplace chain.
+- `bias_residual_strict_fp16` / `bias_residual` = bias + residual add;
+  strict = bit-identical to the add_bias + residual_add chain.
 
 ```
 # GELU-based (GEGLU)
@@ -173,8 +178,15 @@ qkv_split_rope                           # split + RoPE (does not write KV cache
 qkv_split_rope_kvcache_fp16              # ★ encoder / decoder workhorse: split + RoPE + KV cache write
 rope_apply                               # apply RoPE to existing Q/K
 rope_rotate_half_fp16                    # GPT-NeoX style rotate_half
+qk_norm_rope_rotate_half_bf16/fp16       # fused per-head RMSNorm + rotate_half RoPE (in-place, GQA via Q/K calls)
 gpu_repeat_interleave_heads              # expand GQA key/value (when implicit broadcast is not used)
 ```
+
+**Fusing q/k norm with RoPE**: models with per-head Q/K RMSNorm before
+RoPE (Qwen3 / GROOT N1.7 style) replace the 4-launch
+`rms_norm x2 + rope_rotate_half x2` chain with one
+`qk_norm_rope_rotate_half_fp16` call per tensor (measured 1.3-2.8x on the
+pair at S=257..4096, RTX 4090).
 
 **Picking a RoPE style**:
 - Pi0.5 / Pi0: pair-interleave (Q/K weights stored already `interleave_qk`-transformed) + `qkv_split_rope_kvcache_fp16`.

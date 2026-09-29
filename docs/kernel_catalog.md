@@ -7,7 +7,7 @@
 > before adopting the framework.
 >
 > **TL;DR**: FlashRT exports pybind entries across three modules:
-> **`flash_rt_kernels`** (~98 entries; memory-bound ops, fp8
+> **`flash_rt_kernels`** (~103 entries; memory-bound ops, fp8
 > quant/dequant, cuBLASLt wrappers, Thor FMHA — always built),
 > **`flash_rt_fp4`** (~23 entries; NVFP4 weight prep and SM120
 > block-scaled GEMM wrappers — built on SM100+/SM120),
@@ -67,7 +67,7 @@ importable at configure time; it carries **zero new compute kernels**
 
 ---
 
-## 1. Norm (14 kernels)
+## 1. Norm (17 kernels)
 
 RMSNorm and LayerNorm variants, parameterized on compute dtype, output
 dtype (float vs FP8-quantized), weight presence, and Ada / style
@@ -88,6 +88,9 @@ modulation.
 | `ada_layer_norm_fp16` | fp16 + style tensor | Pi0.5 decoder AdaLN |
 | `ada_rms_norm_style` / `_fp8` | AdaRMSNorm with style modulation | Used by DiT blocks |
 | `adarms_fp16` | AdaRMSNorm, explicit style weight | |
+| `qk_norm_rope_rotate_half_bf16` / `_fp16` | per-head Q/K RMSNorm + rotate-half RoPE, in-place | GROOT N1.6 Thor tier / N1.7 SM89 LLM backbone; replaces rms_norm x2 + rope x2 |
+| `bias_residual_strict_fp16` | bias + residual add, legacy-chain bit-parity | strict = rounds x+bias to fp16 first |
+| `bias_gelu_inplace_bf16` / `_fp16` / `_strict_fp16` | bias + tanh-GELU in-place | strict = bit-identical to add_bias + gelu_inplace |
 
 ## 2. Activation (4 kernels)
 
@@ -170,7 +173,7 @@ The RTX backend (`RtxFlashAttnBackend`) auto-dispatches between
 `fa2.fwd_fp16` and `fa2.fwd_bf16` based on buffer dtype. The Thor
 backend (`ThorFlashAttnBackend`) uses the decomposed path above.
 
-## 7. RoPE / QKV split (6 kernels)
+## 7. RoPE / QKV split (7 kernels)
 
 These fuse the projection output → head split → optional RoPE →
 optional KV-cache write into a single kernel, saving one memory
