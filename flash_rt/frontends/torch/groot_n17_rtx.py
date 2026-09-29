@@ -122,6 +122,22 @@ class GrootN17TorchFrontendRtx(GrootN17TorchFrontendThor):
             "ff_down_w": [w.data_ptr() for w in self._dit_ff_down_w],
             "ff_down_b": [b.data_ptr() for b in self._dit_ff_down_b],
         }
+        # Packed QKV for the 16 self-attn layers (li=2j+1): load-time
+        # concat, same convention as the Thor fp8 tier (see
+        # groot_n17_thor.py). Opt-in — dit_forward falls back to the
+        # 3-GEMM path without these keys.
+        if not hasattr(self, "_dit_qkv_w"):
+            self._dit_qkv_w, self._dit_qkv_b = [], []
+            for j in range(16):
+                li = 2 * j + 1
+                qw = torch.cat([self._dit_q_w[li], self._dit_k_w[li],
+                                self._dit_v_w[li]], dim=0).contiguous()
+                qb = torch.cat([self._dit_q_b[li], self._dit_k_b[li],
+                                self._dit_v_b[li]]).contiguous()
+                self._dit_qkv_w.append(qw)
+                self._dit_qkv_b.append(qb)
+        weights["qkv_w"] = [w.data_ptr() for w in self._dit_qkv_w]
+        weights["qkv_b"] = [b.data_ptr() for b in self._dit_qkv_b]
         Skv_text = int(self._dit_cross_K[0].shape[0])
         Skv_image = int(self._dit_cross_K[1].shape[0])
         dims = {
@@ -131,11 +147,16 @@ class GrootN17TorchFrontendRtx(GrootN17TorchFrontendThor):
             "Skv_text": Skv_text,
             "Skv_image": Skv_image,
         }
+        if not hasattr(self, "_dit_qkv_buf"):
+            self._dit_qkv_buf = torch.empty(
+                int(Sa), 3 * 1536, dtype=torch.bfloat16,
+                device=self.device)
         bufs_ptrs = {
             "h": bufs["dit_h"].data_ptr(),
             "xn": bufs["dit_xn"].data_ptr(),
             "o_proj_out": bufs["dit_o_proj_out"].data_ptr(),
             "ff_proj_out": bufs["dit_ff_proj_out"].data_ptr(),
+            "qkv_buf": self._dit_qkv_buf.data_ptr(),
         }
         if not hasattr(self, "_gemm"):
             import flash_rt.flash_rt_kernels as _fvk

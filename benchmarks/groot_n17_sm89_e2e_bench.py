@@ -200,9 +200,14 @@ def build_backbone(Se=768):
                            "vl_self_attn": (Se, Dl)})
 
     # ── DiT fixture (32 layers, 4 steps) ──
-    from tests.test_groot_n17_sm89_ele_fusion import _dit_fixture
-    Pth, _, dit_dims, mk_dw, mk_db, dkeep, (Sa, Dd) = _dit_fixture()
-    dw, db = mk_dw(), mk_db()
+    from tests.test_groot_n17_sm89_ele_fusion import (
+        _dit_fixture, _merged_dit_fixture)
+    # merged fixture: same weights + packed qkv_w/qkv_b keys; the shim leg
+    # drops them (legacy 3-GEMM), the fused leg keeps them (merged path).
+    Pth, _, dit_dims, mk_dw, mk_db, dkeep, (Sa, Dd) = _merged_dit_fixture()
+    dw_m, db_m = mk_dw(), mk_db()
+    dw_l = {k: v for k, v in dw_m.items() if k not in ("qkv_w", "qkv_b")}
+    db_l = {k: v for k, v in db_m.items() if k != "qkv_buf"}
     dit_attn = _StubDiTAttn(Sa, Dd)
 
     def run_backbone(fvkm, mask=(1, 1, 1, 1, 1, 1)):
@@ -230,9 +235,14 @@ def build_backbone(Se=768):
                 gemm, fvkm, vl_bufs, vsw, vl_dims, vl_scales, attn=attn,
                 stream=0)
         if m_dit:
+            # legacy leg runs with _legacy_drops_qkv set -> 3-GEMM weights
+            legacy_drops = globals().get('_LEGACY_DROPS_QKV', False)
+            dw_use = dw_l if legacy_drops else dw_m
+            db_use = db_l if legacy_drops else db_m
             for _ in range(4):
                 Pth.dit_forward(
-                    gemm, fvkm, db, dw, dit_dims, attn=dit_attn, stream=0)
+                    gemm, fvkm, db_use, dw_use, dit_dims,
+                    attn=dit_attn, stream=0)
 
     return run_backbone, fvk, _legacy_fvk_shim()
 
@@ -264,7 +274,11 @@ def bench_e2e(Se=768, iters=100):
         return sorted(s.elapsed_time(e)
                       for s, e in zip(st, en))[iters // 2]
 
+    # legacy leg: shim fvk AND legacy 3-GEMM DiT weights
+    globals()['_LEGACY_DROPS_QKV'] = True
     t_legacy = time_leg(lambda: run_backbone(shim))
+    globals()['_LEGACY_DROPS_QKV'] = False
+    # fused leg: fused fvk + merged packed-QKV DiT
     t_fused = time_leg(lambda: run_backbone(fvkm_fused))
     print(f"[e2e synthetic] Se={Se} (ViT 24L + DS 3 + LLM 16L + VL 4L "
           f"+ DiT 32L x4 steps):")

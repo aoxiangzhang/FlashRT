@@ -1139,6 +1139,20 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
             fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
             fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
             attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
+        elif is_self and "qkv_w" in weights and "qkv_buf" in bufs:
+            # Packed-QKV merged path (opt-in): one (Sa, 3D) bf16 GEMM over
+            # the load-time-concatenated weights (same convention as the
+            # fp8 tier, groot_n17_thor.py), then one split+bias scatter
+            # into the backend Q/K/V slots. Replaces 3 launch-bound small
+            # GEMMs + 3 add_bias (6 launches -> 2).
+            j_self = (li - 1) // 2
+            qkv_buf_ptr = int(bufs["qkv_buf"])
+            gemm.bf16_nn(xn_ptr, int(weights["qkv_w"][j_self]),
+                          qkv_buf_ptr, Sa, 3 * D, D, int(stream))
+            fvk.qkv_split_bias_bf16(
+                qkv_buf_ptr, int(weights["qkv_b"][j_self]),
+                Q_ptr, K_ptr, V_ptr, Sa, D, D, D, int(stream))
+            attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
         else:
             gemm.bf16_nn(xn_ptr, int(weights["q_w"][li]),
                           Q_ptr, Sa, D, D, int(stream))

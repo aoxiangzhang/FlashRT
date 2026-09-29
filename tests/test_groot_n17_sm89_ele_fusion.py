@@ -621,3 +621,116 @@ if __name__ == "__main__":
     test_dit_forward_fused_matches_legacy()
     test_dit_layer_matches_frozen_origin_main_chain()
     print("ALL PASS")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PR-2: DiT QKV GEMM structural merge (packed (Sa,3D) GEMM + split)
+# ══════════════════════════════════════════════════════════════════════
+
+def _merged_dit_fixture(Sa=41):
+    """Same as _dit_fixture plus the packed-QKV keys for the 16 self-attn
+    layers (li=2j+1): qkv_w[j] = cat([q_w,k_w,v_w], dim=0) (3D, D) bf16
+    contiguous, qkv_b[j] = cat([q_b,k_b,v_b]) (3D,), and a qkv_buf staging
+    (Sa, 3D). Mirrors the Thor fp8 path's load-time concat
+    (groot_n17_thor.py:678)."""
+    import copy
+    P, gemm, dims, mk_weights, mk_bufs, keep, (Sa_, D) = _dit_fixture(Sa)
+    FF = dims["FF"]
+
+    def mk_merged_weights():
+        torch.manual_seed(101)
+        w = {"scale_msa": [], "shift_msa": [],
+             "q_w": [], "q_b": [], "k_w": [], "k_b": [],
+             "v_w": [], "v_b": [], "o_w": [], "o_b": [],
+             "ff_proj_w": [], "ff_proj_b": [],
+             "ff_down_w": [], "ff_down_b": []}
+        for li in range(32):
+            for nm in ("scale_msa", "shift_msa"):
+                w[nm].append(torch.randn(D, device=_DEV, dtype=_BF16))
+            for nm, N, K in (("q_w", D, D), ("k_w", D, D), ("v_w", D, D),
+                             ("o_w", D, D), ("ff_proj_w", FF, D),
+                             ("ff_down_w", D, FF)):
+                w[nm].append(torch.randn(N, K, device=_DEV, dtype=_BF16))
+            for nm, N in (("q_b", D), ("k_b", D), ("v_b", D), ("o_b", D),
+                          ("ff_proj_b", FF), ("ff_down_b", D)):
+                w[nm].append(torch.randn(N, device=_DEV, dtype=_BF16))
+        keep.append(w)
+        # packed keys for self-attn layers only (li=2j+1, j=0..15)
+        w["qkv_w"], w["qkv_b"] = [], []
+        for j in range(16):
+            li = 2 * j + 1
+            qw = torch.cat([w["q_w"][li], w["k_w"][li], w["v_w"][li]],
+                            dim=0).contiguous()
+            qb = torch.cat([w["q_b"][li], w["k_b"][li],
+                            w["v_b"][li]]).contiguous()
+            keep.extend([qw, qb])
+            w["qkv_w"].append(qw.data_ptr())
+            w["qkv_b"].append(qb.data_ptr())
+        ptrs = {}
+        for k, v in w.items():
+            if k in ("qkv_w", "qkv_b"):
+                ptrs[k] = v          # already ptr lists
+            elif k in ("scale_msa", "shift_msa"):
+                ptrs[k] = [t.data_ptr() for t in v]
+            else:
+                ptrs[k] = [t.data_ptr() for t in v]
+        return ptrs
+
+    def mk_merged_bufs():
+        torch.manual_seed(102)
+        b = {"h": torch.randn(Sa, D, device=_DEV, dtype=_BF16),
+             "xn": torch.empty(Sa, D, device=_DEV, dtype=_BF16),
+             "o_proj_out": torch.empty(Sa, D, device=_DEV, dtype=_BF16),
+             "ff_proj_out": torch.empty(Sa, FF, device=_DEV,
+                                         dtype=_BF16)}
+        keep.append(b)
+        qkv_buf = torch.empty(Sa, 3 * D, device=_DEV, dtype=_BF16)
+        keep.append(qkv_buf)
+        ptrs = {k: t.data_ptr() for k, t in b.items()}
+        ptrs["qkv_buf"] = qkv_buf.data_ptr()
+        return ptrs
+
+    return P, gemm, dims, mk_merged_weights, mk_merged_bufs, keep, (Sa, D)
+
+
+def test_dit_qkv_merge_matches_3gemm_chain():
+    """Merged packed-QKV path (opt-in keys) vs the legacy 3-GEMM chain on
+    the same GEMM runner: the packed GEMM's row content and the split
+    kernel's bias+scatter must reproduce Q/K/V slots bit-identically."""
+    P, gemm, dims, mk_mw, mk_mb, keep, (Sa, D) = _merged_dit_fixture()
+    FF = dims["FF"]
+
+    # Leg A: merged path (weights include qkv_w/qkv_b, bufs qkv_buf)
+    w_m, b_m = mk_mw(), mk_mb()
+    bmod = keep[-2]          # the mk_mb buffers dict (h key is a tensor)
+    h_seed = bmod["h"].clone()
+    attnA = _StubDiTAttn(Sa, D)
+    P.dit_forward(gemm, fvk, b_m, w_m, dims, attn=attnA, stream=0,
+                  layers_subset=[1])
+    h_a = bmod["h"].clone()
+
+    # Leg B: legacy 3-GEMM path (same buffers, h restored, no qkv keys)
+    bmod["h"].copy_(h_seed)
+    w_l = {k: v for k, v in w_m.items() if k not in ("qkv_w", "qkv_b")}
+    b_l = {k: v for k, v in b_m.items() if k != "qkv_buf"}
+    attnB = _StubDiTAttn(Sa, D)
+    attnB._state = attnA._state.clone()
+    P.dit_forward(gemm, fvk, b_l, w_l, dims, attn=attnB, stream=0,
+                  layers_subset=[1])
+    h_b = bmod["h"].clone()
+
+    # Path-selection guard: the merged path MUST have been taken (it
+    # writes qkv_buf; the legacy path never touches it). Guards against
+    # the test silently passing via the untouched fallback.
+    qkv_buf = keep[-1]
+    assert torch.count_nonzero(qkv_buf) > 0, \
+        "merged path not taken — qkv_buf untouched"
+    assert torch.equal(h_a, h_b), (
+        (h_a.float() - h_b.float()).abs().max().item())
+    print(f"[dit qkv merge] 1 self-attn layer merged == 3-GEMM chain "
+          "(torch.equal)")
+
+
+if __name__ == "__main__":
+    test_dit_qkv_merge_matches_3gemm_chain()
+    print("PR-2 ALL PASS")
