@@ -292,6 +292,7 @@ def _legacy_fvk_shim():
                                       stream=0):
         fvk.rms_norm_fp16(x, w, x, S * NH, HD, eps)
         fvk.rope_rotate_half_fp16(x, cos_t, sin_t, S, NH, HD)
+        return 0
 
     def bias_gelu_inplace_strict_fp16(x, bias, M, N, stream=0):
         fvk.add_bias_fp16(x, bias, M, N)
@@ -326,7 +327,6 @@ def test_qwen3vl_llm_forward_fused_matches_legacy():
     # Leg B: legacy chains via the shim, identical weights/bufs
     w2, b2 = mk_weights(), mk_bufs()
     # overwrite leg B's h with the same seed values at the same address
-    torch.Tensor._make_wrapper_subclass  # noqa: B018 (keep import surface)
     keep[-1]["h"].copy_(h_seed)
     attn2 = _StubAttn(S, D)
     attn2._state = attn._state.clone()
@@ -334,12 +334,12 @@ def test_qwen3vl_llm_forward_fused_matches_legacy():
                           attn=attn2, stream=0)
     h_b = keep[-1]["h"].clone()
 
-    a = h_a.float().flatten()
-    b = h_b.float().flatten()
-    cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
-    max_abs = (a - b).abs().max().item()
-    assert cos >= 0.9999, cos
-    print(f"[llm A/B] S={S} cos={cos:.7f} max_abs={max_abs:.3e}")
+    # Measured bit-equal with the deterministic fixture; keep the hard
+    # gate at torch.equal (a 1-ulp-per-layer drift regression must fail).
+    assert torch.equal(h_a, h_b), ((h_a.float() - h_b.float()).abs().max())
+    cos = torch.nn.functional.cosine_similarity(
+        h_a.float().flatten(), h_b.float().flatten(), dim=0).item()
+    print(f"[llm A/B] S={S} bit-equal (cos={cos:.7f})")
 
 
 _BF16 = torch.bfloat16
@@ -348,9 +348,9 @@ _BF16 = torch.bfloat16
 def test_qkv_split_bias_bf16_matches_legacy_chain():
     # GROOT DiT self-attn: Sa tokens, D=1536, NH=32 heads x HD=48; the
     # kernel is generic — sweep asymmetric head splits too.
-    for (S, Hq, Hk, Hv, HD) in [(41, 1536, 1536, 1536, 1),
-                                (41, 32 * 48, 32 * 48, 32 * 48, 1),
-                                (1024, 2048, 1024, 1024, 1)]:
+    for (S, Hq, Hk, Hv) in [(41, 1536, 1536, 1536),
+                            (41, 32 * 48, 32 * 48, 32 * 48),
+                            (1024, 2048, 1024, 1024)]:
         W = Hq + Hk + Hv
         packed = torch.randn(S, W, device=_DEV, dtype=_BF16)
         bias = torch.randn(W, device=_DEV, dtype=_BF16)
@@ -517,6 +517,98 @@ def test_dit_forward_fused_matches_legacy():
     print(f"[dit A/B] Sa={Sa}: bit-equal across 32 layers")
 
 
+def test_dit_layer_matches_frozen_origin_main_chain():
+    """Anti-regression golden: ONE DiT layer (li=1, self-attn, bf16
+    fallback branch) vs a FROZEN copy of the origin/main chain (verbatim
+    pre-PR elementwise sequence, same GemmRunner). Catches pipeline-body
+    regressions that fused-vs-shimmed A/B cannot (both its legs run the
+    same body) — e.g. a dropped FFN residual would fail this test while
+    the shim A/B stays bit-equal.
+
+    Torch matmul cannot serve as the reference: the bf16 GemmRunner's
+    fp32-accumulated split-K order differs from torch's by ~0.3 absolute
+    on (41,1536) shapes, far above the fusions' ulp-level deltas. The
+    frozen chain shares the GEMMs, so the gate stays torch.equal.
+    """
+    P, gemm, dims, mk_weights, mk_bufs, keep, (Sa, D) = _dit_fixture()
+    FF = dims["FF"]
+    torch.manual_seed(101)
+    scale = torch.randn(1, D, device=_DEV, dtype=_BF16) * 0.3
+    shift = torch.randn(1, D, device=_DEV, dtype=_BF16) * 0.1
+    q_w = torch.randn(D, D, device=_DEV, dtype=_BF16)
+    q_b = torch.randn(D, device=_DEV, dtype=_BF16)
+    k_w = torch.randn(D, D, device=_DEV, dtype=_BF16)
+    k_b = torch.randn(D, device=_DEV, dtype=_BF16)
+    v_w = torch.randn(D, D, device=_DEV, dtype=_BF16)
+    v_b = torch.randn(D, device=_DEV, dtype=_BF16)
+    o_w = torch.randn(D, D, device=_DEV, dtype=_BF16)
+    o_b = torch.randn(D, device=_DEV, dtype=_BF16)
+    ff_w = torch.randn(FF, D, device=_DEV, dtype=_BF16)
+    ff_b = torch.randn(FF, device=_DEV, dtype=_BF16)
+    dn_w = torch.randn(D, FF, device=_DEV, dtype=_BF16)
+    dn_b = torch.randn(D, device=_DEV, dtype=_BF16)
+    h0 = torch.randn(Sa, D, device=_DEV, dtype=_BF16)
+    keep.extend([scale, shift, q_w, q_b, k_w, k_b, v_w, v_b,
+                o_w, o_b, ff_w, ff_b, dn_w, dn_b, h0])
+
+    weights = {k: [v.data_ptr()] * 2 for k, v in
+               [("scale_msa", scale), ("shift_msa", shift),
+                ("q_w", q_w), ("q_b", q_b), ("k_w", k_w), ("k_b", k_b),
+                ("v_w", v_w), ("v_b", v_b), ("o_w", o_w), ("o_b", o_b),
+                ("ff_proj_w", ff_w), ("ff_proj_b", ff_b),
+                ("ff_down_w", dn_w), ("ff_down_b", dn_b)]}
+
+    # Leg A: current pipeline (fused), li=1 (self-attn)
+    attnA = _StubDiTAttn(Sa, D)
+    hA = h0.clone()
+    xn = torch.empty_like(hA); oo = torch.empty_like(hA)
+    ff = torch.empty(Sa, FF, device=_DEV, dtype=_BF16)
+    keep.extend([hA, xn, oo, ff])
+    bufsA = {"h": hA.data_ptr(), "xn": xn.data_ptr(),
+             "o_proj_out": oo.data_ptr(), "ff_proj_out": ff.data_ptr()}
+    P.dit_forward(gemm, fvk, bufsA, weights, dims, attn=attnA, stream=0,
+                  layers_subset=[1])
+    h_a = hA.clone()
+
+    # Leg B: frozen origin/main chain, one layer, same GEMM runner
+    attnB = _StubDiTAttn(Sa, D)
+    attnB._state = attnA._state.clone()
+    h = h0.clone()
+    xnB = torch.empty_like(h); ooB = torch.empty_like(h)
+    ffB = torch.empty(Sa, FF, device=_DEV, dtype=_BF16)
+    hp, xp, op, fp = (_p(h), _p(xnB), _p(ooB), _p(ffB))
+    sc_p = scale.reshape(-1).contiguous().data_ptr()
+    sh_p = shift.reshape(-1).contiguous().data_ptr()
+
+    # -- frozen pre-PR sequence for li=1 (verbatim from 839b1597) --
+    fvk.ada_layer_norm_bf16(hp, sc_p, sh_p, xp, Sa, D, 1e-5, 0)
+    slots = attnB.get_slot_ptrs("dit_self", 0)
+    Qp, Kp, Vp, Op = (slots["Q"], slots["K"], slots["V"], slots["O"])
+    gemm.bf16_nn(xp, q_w.data_ptr(), Qp, Sa, D, D, 0)
+    fvk.add_bias_bf16(Qp, q_b.data_ptr(), Sa, D, 0)
+    gemm.bf16_nn(xp, k_w.data_ptr(), Kp, Sa, D, D, 0)
+    fvk.add_bias_bf16(Kp, k_b.data_ptr(), Sa, D, 0)
+    gemm.bf16_nn(xp, v_w.data_ptr(), Vp, Sa, D, D, 0)
+    fvk.add_bias_bf16(Vp, v_b.data_ptr(), Sa, D, 0)
+    attnB.run("dit_self", 0, q_seq=Sa, kv_seq=Sa, stream=0)
+    gemm.bf16_nn(Op, o_w.data_ptr(), op, Sa, D, D, 0)
+    fvk.add_bias_bf16(op, o_b.data_ptr(), Sa, D, 0)
+    fvk.residual_add(hp, op, Sa * D, 0)
+    fvk.layer_norm_no_affine_bf16(hp, xp, Sa, D, 1e-5, 0)
+    gemm.bf16_nn(xp, ff_w.data_ptr(), fp, Sa, FF, D, 0)
+    fvk.add_bias_bf16(fp, ff_b.data_ptr(), Sa, FF, 0)
+    fvk.gelu_inplace(fp, Sa * FF, 0)
+    gemm.bf16_nn(fp, dn_w.data_ptr(), op, Sa, D, FF, 0)
+    fvk.add_bias_bf16(op, dn_b.data_ptr(), Sa, D, 0)
+    fvk.residual_add(hp, op, Sa * D, 0)   # residual 2 — the C1 guard
+    h_b = h.clone()
+
+    assert torch.equal(h_a, h_b), \
+        ((h_a.float() - h_b.float()).abs().max().item())
+    print("[dit golden] 1-layer fused == frozen origin/main chain "
+          "(torch.equal)")
+
+
 if __name__ == "__main__":
     test_qk_norm_rope_fused_matches_legacy_chain()
     test_qk_norm_rope_fused_rejects_bad_hd()
@@ -527,4 +619,5 @@ if __name__ == "__main__":
     test_residual_add_bias_bf16_matches_legacy_chain()
     test_dit_kernel_fusions_match_legacy_chains()
     test_dit_forward_fused_matches_legacy()
+    test_dit_layer_matches_frozen_origin_main_chain()
     print("ALL PASS")

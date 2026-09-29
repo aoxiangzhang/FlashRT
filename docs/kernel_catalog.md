@@ -7,7 +7,7 @@
 > before adopting the framework.
 >
 > **TL;DR**: FlashRT exports pybind entries across three modules:
-> **`flash_rt_kernels`** (~103 entries; memory-bound ops, fp8
+> **`flash_rt_kernels`** (~105 entries; memory-bound ops, fp8
 > quant/dequant, cuBLASLt wrappers, Thor FMHA — always built),
 > **`flash_rt_fp4`** (~23 entries; NVFP4 weight prep and SM120
 > block-scaled GEMM wrappers — built on SM100+/SM120),
@@ -67,7 +67,7 @@ importable at configure time; it carries **zero new compute kernels**
 
 ---
 
-## 1. Norm (17 kernels)
+## 1. Norm (16 kernels)
 
 RMSNorm and LayerNorm variants, parameterized on compute dtype, output
 dtype (float vs FP8-quantized), weight presence, and Ada / style
@@ -88,8 +88,7 @@ modulation.
 | `ada_layer_norm_fp16` | fp16 + style tensor | Pi0.5 decoder AdaLN |
 | `ada_rms_norm_style` / `_fp8` | AdaRMSNorm with style modulation | Used by DiT blocks |
 | `adarms_fp16` | AdaRMSNorm, explicit style weight | |
-| `qk_norm_rope_rotate_half_bf16` / `_fp16` | per-head Q/K RMSNorm + rotate-half RoPE, in-place | GROOT N1.6 Thor tier / N1.7 SM89 LLM backbone; replaces rms_norm x2 + rope x2 |
-| `bias_residual_strict_fp16` | bias + residual add, legacy-chain bit-parity | strict = rounds x+bias to fp16 first |
+| `bias_residual_strict_bf16` / `_fp16` | bias + residual add, legacy-chain bit-parity | strict = rounds x+bias to the storage dtype first |
 | `bias_gelu_inplace_bf16` / `_fp16` / `_strict_fp16` | bias + tanh-GELU in-place | strict = bit-identical to add_bias + gelu_inplace |
 
 ## 2. Activation (4 kernels)
@@ -116,6 +115,8 @@ round-trips.
 | `gate_mul_residual` | `gate * up + residual` | |
 | `gate_res_fp16` | Same, fp16 | |
 | `gate_res_adarms_fp8_static_fp16` | `x + gate*up → AdaRMSNorm → FP8` in one launch | Pi0.5 decoder; saves 3 ops |
+| `qkv_split_bias_bf16` | Split packed QKV + per-column bias in one pass | GEMM outputs that can't carry a bias epilogue |
+| `residual_add_bias_bf16` | `residual += x + bias` (fp32 sum) | Same; 1-bf16-ulp vs the two-round chain |
 | `gate_residual_ada_norm_fp8` | Variant | |
 | `fused_adarms_fp8_static_fp16` | `AdaRMSNorm → FP8` | |
 | `residual_add` / `_fp16` | Plain residual | |
@@ -186,6 +187,7 @@ traversal per layer.
 | `qkv_split_rope_kvcache_fp16` | Same + write K/V into a layered KV cache slot in one pass |
 | `rope_apply` | Standalone RoPE (for cases without qkv_split) |
 | `rope_rotate_half_fp16` | Rotate half the last-dim axis; also reusable for DiT cross-attn |
+| `qk_norm_rope_rotate_half_bf16` / `_fp16` | Fused per-head Q/K RMSNorm + rotate-half RoPE, in-place; GQA via per-tensor calls | GROOT N1.6 Thor / N1.7 SM89 LLM; replaces rms_norm x2 + rope x2 (1.5-3.5x on the pair) |
 
 ## 8. Vision patch embedding (2 kernels)
 

@@ -1247,6 +1247,7 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
                           o_out_ptr, Sa, D, FF, int(stream))
             fvk.add_bias_bf16(o_out_ptr, int(weights["ff_down_b"][li]),
                                Sa, D, int(stream))
+        fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))
 
 
 def embodiment_state_encode(gemm, fvk, bufs, weights, dims, *,

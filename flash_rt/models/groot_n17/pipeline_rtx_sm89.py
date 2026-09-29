@@ -363,12 +363,16 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
         # launch per tensor (GQA via separate Q/K calls). Divergence from
         # the old 4-launch chain is bounded at 1 fp16 ulp per element
         # (warp-butterfly vs block-tree reduce; differential-tested).
-        fvk.qk_norm_rope_rotate_half_fp16(
+        rc_q = fvk.qk_norm_rope_rotate_half_fp16(
             Q_ptr, int(weights["q_norm_w"][li]), cos_ptr, sin_ptr,
             S, NHQ, HD, 1e-6, int(stream))
-        fvk.qk_norm_rope_rotate_half_fp16(
+        rc_k = fvk.qk_norm_rope_rotate_half_fp16(
             K_ptr, int(weights["k_norm_w"][li]), cos_ptr, sin_ptr,
             S, NHKV, HD, 1e-6, int(stream))
+        if rc_q != 0 or rc_k != 0:
+            raise RuntimeError(
+                "qk_norm_rope_rotate_half_fp16 failed "
+                f"(rc_q={rc_q}, rc_k={rc_k}); HD must be 128")
 
         # ── GQA expand: K, V from NHKV → NHQ heads ──
         fvk.gpu_repeat_interleave_heads(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
