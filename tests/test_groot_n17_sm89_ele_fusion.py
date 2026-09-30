@@ -739,3 +739,125 @@ def test_dit_qkv_merge_matches_3gemm_chain():
 if __name__ == "__main__":
     test_dit_qkv_merge_matches_3gemm_chain()
     print("PR-2 ALL PASS")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PR-3: pipeline_rtx_fp8.py elementwise wiring (GEMM-shim differential)
+# ══════════════════════════════════════════════════════════════════════
+
+class _ShimGemm:
+    """Stand-in for GemmRunner on sm89: implements fp8_descale_fp16 via
+    the Ada-proven fp8_nt_dev (bf16 out) + cast_bf16_to_fp16 pattern.
+    Both A/B legs run the SAME shim, so the fused-vs-legacy elementwise
+    differential stays isolated; the shim's numeric differences from the
+    real sm120 descale GEMM cancel out of the comparison."""
+
+    def __init__(self, fvk_mod, max_elems):
+        self.g = fvk_mod.GemmRunner()
+        self.tmp = torch.empty(max_elems, device=_DEV,
+                               dtype=torch.bfloat16)
+        self.fvk = fvk_mod
+
+    def fp8_descale_fp16(self, A, B, D, M, N, K, act_s, w_s, stream=0):
+        self.g.fp8_nt_dev(int(A), int(B), self.tmp.data_ptr(),
+                          M, N, K, int(act_s), int(w_s), int(stream))
+        self.fvk.cast_bf16_to_fp16(self.tmp.data_ptr(), int(D),
+                                   M * N, int(stream))
+
+
+def test_fp8_pipeline_llm_fused_matches_legacy():
+    """Wiring-level A/B of pipeline_rtx_fp8.qwen3vl_llm_forward: fused
+    elementwise path vs the legacy-chain shim, with the GEMM shim so the
+    stage runs on sm89. Gate: bit-equal (all fused sites here are strict
+    except qk-norm, whose re-association is pinned at 1 ulp by the
+    kernel tests — so gate at torch.equal too, same as the sm89 stage)."""
+    import types
+    from flash_rt.models.groot_n17 import pipeline_rtx_fp8 as P
+
+    S, D, NHQ, NHKV, HD, FF, L = 1024, 2048, 16, 8, 128, 6144, 16
+    torch.manual_seed(301)
+    fp8 = torch.float8_e4m3fn
+    keep = []
+
+    def rnd(*shape, dtype=_FP16):
+        return torch.randn(*shape, device=_DEV, dtype=dtype)
+
+    def fp8w(N, K):
+        w = (torch.randn(N, K, device=_DEV, dtype=torch.float32) * 0.02).to(fp8)
+        ws = torch.tensor([max(0.06 / 448.0, 1e-8)], device=_DEV,
+                          dtype=torch.float32)
+        keep.extend([w, ws])
+        return int(w.data_ptr()), int(ws.data_ptr())
+
+    def act_s():
+        s = torch.full((1,), max(4.0 / 448.0, 1e-8), device=_DEV,
+                       dtype=torch.float32)
+        keep.append(s)
+        return int(s.data_ptr())
+
+    def mk_weights():
+        w = {"in_ln_w": [rnd(D).data_ptr() for _ in range(L)],
+             "post_ln_w": [rnd(D).data_ptr() for _ in range(L)],
+             "q_norm_w": [rnd(HD).data_ptr() for _ in range(L)],
+             "k_norm_w": [rnd(HD).data_ptr() for _ in range(L)],
+             "cos": rnd(S, HD).data_ptr(), "sin": rnd(S, HD).data_ptr(),
+             "deepstack_inject": [0] * L}
+        for name, N, K in [("q_w", NHQ * HD, D), ("k_w", NHKV * HD, D),
+                           ("v_w", NHKV * HD, D), ("o_w", D, D),
+                           ("gate_w", FF, D), ("up_w", FF, D),
+                           ("down_w", D, FF)]:
+            w[name], w[name.replace("_w", "_ws")] = \
+                zip(*[fp8w(N, K) for _ in range(L)])
+        for k in ("q_w", "k_w", "v_w", "o_w", "gate_w", "up_w", "down_w"):
+            w[k] = list(w[k]); w[k.replace("_w", "_ws")] = list(w[k.replace("_w", "_ws")])
+        w["gate_ws"], w["up_ws"] = w["gate_ws"], w["up_ws"]
+        return w
+
+    def mk_bufs():
+        b = {"h": rnd(S, D), "xn": rnd(S, D),
+             "xn_fp8": rnd(S, D).view(torch.uint8).view(fp8),
+             "Q": rnd(S, NHQ * HD), "K": rnd(S, NHKV * HD),
+             "V": rnd(S, NHKV * HD), "K_exp": rnd(S, NHQ * HD),
+             "V_exp": rnd(S, NHQ * HD), "o_proj_out": rnd(S, D),
+             "gate_out": rnd(S, FF), "up_out": rnd(S, FF),
+             "gu_fp8": rnd(S, FF).view(torch.uint8).view(fp8)}
+        keep.append(b)
+        return {k: v.data_ptr() for k, v in b.items()}
+
+    dims = {"S": S, "D": D, "NHQ": NHQ, "NHKV": NHKV, "HD": HD, "FF": FF}
+    scales = {k: [act_s() for _ in range(L)]
+              for k in ("act_qkv", "act_o", "act_gateup", "act_down")}
+    gemm = _ShimGemm(fvk, S * FF)
+
+    # mk_weights/mk_bufs draw from the module-global RNG; re-seed so both
+    # legs get identical values (same discipline as the LLM fixture).
+    torch.manual_seed(301)
+    wA, bA = mk_weights(), mk_bufs()
+    h_seed = keep[-1]["h"].clone()
+    P.qwen3vl_llm_forward(gemm, fvk, bA, wA, dims, scales,
+                          attn=_StubAttn(S, D), stream=0)
+    h_a = keep[-1]["h"].clone()
+
+    torch.manual_seed(301)
+    shim = _legacy_fvk_shim()
+    wB, bB = mk_weights(), mk_bufs()
+    keep[-1]["h"].copy_(h_seed)
+    P.qwen3vl_llm_forward(gemm, shim, bB, wB, dims, scales,
+                          attn=_StubAttn(S, D), stream=0)
+    h_b = keep[-1]["h"].clone()
+
+    assert torch.equal(h_a, h_b), (
+        (h_a.float() - h_b.float()).abs().max().item())
+    print("[fp8-pipe llm A/B] wiring bit-equal (GEMM shim, sm89)")
+
+
+def _last_h(keep):
+    for t in reversed(keep):
+        if isinstance(t, dict) and "h" in t:
+            return t["h"]
+    raise AssertionError("no h buffer")
+
+
+if __name__ == "__main__":
+    test_fp8_pipeline_llm_fused_matches_legacy()
+    print("PR-3 ALL PASS")
